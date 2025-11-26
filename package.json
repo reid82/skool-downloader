@@ -1,0 +1,32 @@
+{
+  "name": "skool-downloader",
+  "version": "1.0.0",
+  "description": "Bulk download videos from Skool.com membership sites",
+  "main": "dist/index.js",
+  "bin": {
+    "skool-dl": "./dist/index.js"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts"
+  },
+  "keywords": ["skool", "video", "downloader"],
+  "author": "Reid Bates",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "chalk": "^5.6.2",
+    "commander": "^14.0.2",
+    "execa": "^9.6.0",
+    "ora": "^9.0.0",
+    "p-queue": "^9.0.1",
+    "playwright": "^1.57.0",
+    "sanitize-filename": "^1.6.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

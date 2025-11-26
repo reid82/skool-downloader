@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Downloads (course content)
+downloads/
+test-download/
+
+# State files
+.skool-state/
+
+# OS files
+.DS_Store
+
+# Environment
+.env
+.env.local
