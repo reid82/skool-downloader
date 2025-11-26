@@ -2,6 +2,17 @@
 
 Bulk download videos, text content, and resources from Skool.com membership sites.
 
+## Disclaimer
+
+This tool is intended for **personal backup and offline access** of content you have legitimately purchased or have membership access to.
+
+- Only download content from communities you are a paying member of
+- Respect content creators' intellectual property rights
+- Do not redistribute downloaded content
+- Use responsibly and in accordance with Skool's Terms of Service
+
+The author assumes no responsibility for misuse of this tool.
+
 ## Features
 
 - Download videos from multiple providers (Wistia, Vimeo, YouTube, Loom, native)
@@ -120,3 +131,12 @@ npx tsx scripts/migrate-structure.ts --dry-run
 # Run migration
 npx tsx scripts/migrate-structure.ts
 ```
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.
+
+## Author
+
+Reid Bates
+[reid@reidbates.com](mailto:reid@reidbates.com)
