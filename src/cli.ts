@@ -4,8 +4,10 @@ import { getConfig, Config } from './config.js';
 import { logger } from './utils/logger.js';
 import { initBrowser, ensureAuthenticated, exportNetscapeCookies } from './auth/browser-auth.js';
 import { crawlCourseStructure, extractModuleVideo, extractSlug, modulesToLessons, Module } from './crawler/course-crawler.js';
+import { extractModuleContent } from './crawler/content-extractor.js';
 import { ProgressTracker } from './state/progress-tracker.js';
 import { DownloadQueue } from './downloader/download-queue.js';
+import { downloadModuleResources, saveModuleContent } from './downloader/resource-downloader.js';
 import { checkYtDlp, getYtDlpVersion } from './downloader/yt-dlp-wrapper.js';
 import { generateOutputPath, ensureDir } from './utils/file-utils.js';
 import path from 'path';
@@ -20,12 +22,14 @@ program
 // Download command
 program
   .command('download')
-  .description('Download all videos from a Skool classroom')
+  .description('Download all videos and content from a Skool classroom')
   .argument('<url>', 'Skool community URL (e.g., https://www.skool.com/community-name)')
   .option('-o, --output <dir>', 'Output directory', './downloads')
   .option('-c, --concurrency <n>', 'Concurrent downloads', '2')
   .option('-m, --module <name>', 'Download specific module only')
   .option('--no-subs', 'Skip subtitle download')
+  .option('--no-content', 'Skip text content and resource download')
+  .option('--content-only', 'Only download text content and resources (no videos)')
   .option('--dry-run', 'List videos without downloading')
   .action(async (url: string, options) => {
     await downloadCommand(url, options);
@@ -67,6 +71,8 @@ async function downloadCommand(
     concurrency: string;
     module?: string;
     subs: boolean;
+    content: boolean;
+    contentOnly: boolean;
     dryRun: boolean;
   }
 ): Promise<void> {
@@ -76,14 +82,25 @@ async function downloadCommand(
     downloadSubs: options.subs,
   });
 
-  // Check prerequisites
-  if (!(await checkYtDlp())) {
+  const downloadContent = options.content !== false;
+  const contentOnly = options.contentOnly === true;
+
+  // Check prerequisites (yt-dlp only needed for videos)
+  if (!contentOnly && !(await checkYtDlp())) {
     logger.error('yt-dlp not found. Please install it: brew install yt-dlp');
     process.exit(1);
   }
 
-  const ytdlpVersion = await getYtDlpVersion();
-  logger.info(`Using yt-dlp ${ytdlpVersion}`);
+  if (!contentOnly) {
+    const ytdlpVersion = await getYtDlpVersion();
+    logger.info(`Using yt-dlp ${ytdlpVersion}`);
+  }
+
+  if (contentOnly) {
+    logger.info('Content-only mode: downloading text and resources (no videos)');
+  } else if (downloadContent) {
+    logger.info('Downloading videos, text content, and resources');
+  }
 
   // Ensure classroom URL
   const classroomUrl = url.includes('/classroom')
@@ -163,8 +180,13 @@ async function downloadCommand(
     }
     await tracker.save();
 
-    // Create download queue
-    const queue = new DownloadQueue(tracker, config.concurrency);
+    // Create download queue (only if downloading videos)
+    const queue = contentOnly ? null : new DownloadQueue(tracker, config.concurrency);
+
+    // Track content download stats
+    let contentFilesDownloaded = 0;
+    let resourcesDownloaded = 0;
+    let resourcesSkipped = 0;
 
     // Process each module
     let processedCount = 0;
@@ -173,45 +195,10 @@ async function downloadCommand(
     for (const mod of modules) {
       processedCount++;
       logger.startSpinner(
-        `[${processedCount}/${totalModules}] Extracting: ${mod.title}`
+        `[${processedCount}/${totalModules}] Processing: ${mod.title}`
       );
 
-      // Check if already completed
-      const existing = tracker.getLesson(mod.id);
-      if (existing?.status === 'completed') {
-        logger.succeedSpinner(
-          `[${processedCount}/${totalModules}] Already downloaded: ${mod.title}`
-        );
-        continue;
-      }
-
-      // Extract video info
-      const videoInfo = await extractModuleVideo(
-        browser.page,
-        mod,
-        config.delayBetweenPages
-      );
-
-      // Update lesson with video info
-      tracker.updateLesson(mod.id, {
-        videoUrl: videoInfo.downloadUrl || undefined,
-        videoProvider: videoInfo.provider,
-      });
-
-      if (!videoInfo.downloadUrl) {
-        logger.warnSpinner(
-          `[${processedCount}/${totalModules}] No video found: ${mod.title}`
-        );
-        tracker.markSkipped(mod.id, 'No video found');
-        continue;
-      }
-
-      logger.succeedSpinner(
-        `[${processedCount}/${totalModules}] Found ${videoInfo.provider}: ${mod.title}`
-      );
-
-      // Generate output path
-      // Find course index for this module
+      // Generate output directory for this module
       const courseIndex = course.courses.findIndex(c => c.id === mod.courseId);
       const outputPath = generateOutputPath(
         config.downloadDir,
@@ -221,37 +208,143 @@ async function downloadCommand(
         mod.index,
         mod.title
       );
+      // Each lesson gets its own directory (outputPath is the base filename, so add a folder)
+      const moduleDir = outputPath;
 
-      // Add to download queue
-      await queue.add({
-        lesson: tracker.getLesson(mod.id)!,
-        downloadUrl: videoInfo.downloadUrl,
-        outputPath,
-        cookiesFile,
-        referer: mod.url,
-        downloadSubs: config.downloadSubs,
-        subsLang: config.subsLang,
-      });
+      // Check if video already completed (only relevant if downloading videos)
+      const existing = tracker.getLesson(mod.id);
+      if (!contentOnly && existing?.status === 'completed') {
+        logger.succeedSpinner(
+          `[${processedCount}/${totalModules}] Already downloaded: ${mod.title}`
+        );
+        continue;
+      }
+
+      // Navigate to module page (needed for both video and content extraction)
+      await browser.page.goto(mod.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await browser.page.waitForTimeout(config.delayBetweenPages);
+
+      // Extract video info (if not content-only)
+      let videoInfo = null;
+      if (!contentOnly) {
+        videoInfo = await extractModuleVideo(
+          browser.page,
+          mod,
+          0 // Already waited above
+        );
+
+        // Update lesson with video info
+        tracker.updateLesson(mod.id, {
+          videoUrl: videoInfo.downloadUrl || undefined,
+          videoProvider: videoInfo.provider,
+        });
+      }
+
+      // Extract module content (if enabled)
+      if (downloadContent || contentOnly) {
+        logger.updateSpinner(
+          `[${processedCount}/${totalModules}] Extracting content: ${mod.title}`
+        );
+
+        try {
+          const moduleContent = await extractModuleContent(browser.page);
+
+          // Download resources
+          if (moduleContent.embeddedLinks.length > 0 || moduleContent.resources.length > 0) {
+            logger.updateSpinner(
+              `[${processedCount}/${totalModules}] Downloading resources: ${mod.title}`
+            );
+
+            const resourceResults = await downloadModuleResources(moduleContent, moduleDir);
+
+            // Count results
+            for (const result of resourceResults) {
+              if (result.success) {
+                resourcesDownloaded++;
+              } else if (result.skipped) {
+                resourcesSkipped++;
+              }
+            }
+
+            // Save content markdown file
+            await saveModuleContent(moduleContent, mod.title, moduleDir, resourceResults);
+            contentFilesDownloaded++;
+          } else if (moduleContent.description || moduleContent.markdownContent) {
+            // Save content even without resources
+            await saveModuleContent(moduleContent, mod.title, moduleDir, []);
+            contentFilesDownloaded++;
+          }
+        } catch (contentError) {
+          logger.debug(`Failed to extract content for ${mod.title}: ${contentError}`);
+        }
+      }
+
+      // Handle video download (if not content-only)
+      if (!contentOnly) {
+        if (!videoInfo?.downloadUrl) {
+          logger.warnSpinner(
+            `[${processedCount}/${totalModules}] No video found: ${mod.title}`
+          );
+          tracker.markSkipped(mod.id, 'No video found');
+          continue;
+        }
+
+        logger.succeedSpinner(
+          `[${processedCount}/${totalModules}] Found ${videoInfo.provider}: ${mod.title}`
+        );
+
+        // Add to download queue - video goes inside the lesson directory
+        const videoOutputPath = path.join(moduleDir, 'video');
+        await queue!.add({
+          lesson: tracker.getLesson(mod.id)!,
+          downloadUrl: videoInfo.downloadUrl,
+          outputPath: videoOutputPath,
+          cookiesFile,
+          referer: mod.url,
+          downloadSubs: config.downloadSubs,
+          subsLang: config.subsLang,
+        });
+      } else {
+        logger.succeedSpinner(
+          `[${processedCount}/${totalModules}] Content extracted: ${mod.title}`
+        );
+      }
     }
 
     // Save progress
     await tracker.save();
 
-    // Wait for all downloads to complete
-    logger.info('\nStarting downloads...\n');
-    await queue.waitForAll();
+    // Wait for all video downloads to complete (if any)
+    if (queue) {
+      logger.info('\nStarting video downloads...\n');
+      await queue.waitForAll();
+    }
 
     // Final stats
     const stats = tracker.getStats();
     console.log('\n' + chalk.bold('Download Complete!'));
-    console.log(chalk.green(`  Completed: ${stats.completed}`));
-    if (stats.failed > 0) {
-      console.log(chalk.red(`  Failed: ${stats.failed}`));
+
+    if (!contentOnly) {
+      console.log(chalk.cyan('\nVideos:'));
+      console.log(chalk.green(`  Completed: ${stats.completed}`));
+      if (stats.failed > 0) {
+        console.log(chalk.red(`  Failed: ${stats.failed}`));
+      }
+      if (stats.skipped > 0) {
+        console.log(chalk.yellow(`  Skipped: ${stats.skipped}`));
+      }
     }
-    if (stats.skipped > 0) {
-      console.log(chalk.yellow(`  Skipped: ${stats.skipped}`));
+
+    if (downloadContent || contentOnly) {
+      console.log(chalk.cyan('\nContent:'));
+      console.log(chalk.green(`  Content files saved: ${contentFilesDownloaded}`));
+      console.log(chalk.green(`  Resources downloaded: ${resourcesDownloaded}`));
+      if (resourcesSkipped > 0) {
+        console.log(chalk.yellow(`  Resources skipped: ${resourcesSkipped} (auth required or external links)`));
+      }
     }
-    console.log(`\nVideos saved to: ${path.resolve(config.downloadDir)}`);
+
+    console.log(`\nFiles saved to: ${path.resolve(config.downloadDir)}`);
   } finally {
     await browser.close();
     await tracker.save();
